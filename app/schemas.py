@@ -150,6 +150,7 @@ class ClientRead(ClientBase):
     mobile: Optional[str]
     secondary_phone: Optional[str]
     email: Optional[EmailStr]
+    photo_url: Optional[str] = None
     address_line1: Optional[str]
     address_line2: Optional[str]
     city: Optional[str]

@@ -10,7 +10,8 @@ from . import schemas
 
 load_dotenv()
 
-LOGIN_SERVICE_URL = os.getenv("API_URL")
+# Get Login service URL - use local service for development, fallback to env variable
+LOGIN_SERVICE_URL = os.getenv("API_URL") or "http://login:8001"
 http_bearer = HTTPBearer()
 
 def get_current_user(
@@ -23,14 +24,22 @@ def get_current_user(
         }
         if x_agency_id:
             headers["x-agency-id"] = x_agency_id
-        response = requests.get(f"{LOGIN_SERVICE_URL}/profile", headers=headers)
+        # Use /profile/ with trailing slash to match the router prefix
+        profile_url = f"{LOGIN_SERVICE_URL}/profile/" if not LOGIN_SERVICE_URL.endswith('/') else f"{LOGIN_SERVICE_URL}profile/"
+        response = requests.get(profile_url, headers=headers, timeout=10)
         response.raise_for_status()
         user_data = response.json()
         return user_data
-    except requests.exceptions.HTTPError:
+    except requests.exceptions.HTTPError as e:
+        error_detail = f"Invalid authentication credentials"
+        try:
+            error_response = e.response.json() if e.response else {}
+            error_detail = error_response.get('detail', error_detail)
+        except:
+            pass
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
+            detail=error_detail,
         )
     except requests.exceptions.RequestException as e:
         raise HTTPException(

@@ -110,6 +110,7 @@ class Client(Base):
     contact_person_name = Column(String, nullable=True)
     contact_person_phone = Column(String, nullable=True)
     date_of_birth = Column(Date, nullable=True)
+    photo_url = Column(String, nullable=True)
 
     services = relationship("ClientService", back_populates="client", cascade="all, delete-orphan")
     portals = relationship("ClientPortal", back_populates="client", cascade="all, delete-orphan")

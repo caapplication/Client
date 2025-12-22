@@ -1,10 +1,14 @@
 from typing import List
 import uuid
-from fastapi import APIRouter, Depends, status, UploadFile, File
+import os
+from fastapi import APIRouter, Depends, status, UploadFile, File, HTTPException
 from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..database import SessionLocal
 from ..dependencies import get_current_user, get_current_agency
+from ..utils.s3 import upload_file_to_s3, delete_file_from_s3, get_file_from_s3, get_presigned_url
+from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi.responses import StreamingResponse
 import shutil
 
 router = APIRouter()
@@ -123,6 +127,31 @@ def create_client(
     db.add(db_client)
     db.commit()
     db.refresh(db_client)
+    
+    # Create activity log in Finance service
+    try:
+        import requests
+        import os
+        finance_api_url = os.getenv("FINANCE_API_URL", "http://finance:8003")
+        activity_log_data = {
+            "user_id": str(user_id),
+            "action": f"Created client {db_client.name}",
+            "details": f"Client {db_client.name} (ID: {db_client.id}) was created",
+            "client_id": str(db_client.id)
+        }
+        # Note: This requires authentication token to be passed or service-to-service auth
+        # For now, we'll skip if it fails (non-blocking)
+        try:
+            requests.post(
+                f"{finance_api_url}/api/activity_logs/",
+                json=activity_log_data,
+                timeout=2
+            )
+        except Exception:
+            pass  # Non-blocking - activity log creation failure shouldn't break client creation
+    except Exception:
+        pass  # Non-blocking
+    
     return db_client
 
 @router.get("/", response_model=List[schemas.ClientRead])
@@ -241,11 +270,79 @@ def update_client(
         raise HTTPException(status_code=404, detail="Client not found")
 
     update_data = client_in.dict(exclude_unset=True)
+    
+    # Helper function to format values for display
+    def format_value(val):
+        if val is None:
+            return 'None'
+        if isinstance(val, bool):
+            return 'Yes' if val else 'No'
+        if isinstance(val, list):
+            if not val:
+                return 'None'
+            return ', '.join(str(v) for v in val)
+        if isinstance(val, uuid.UUID):
+            return str(val)
+        # Check if it's a date/datetime
+        if hasattr(val, 'isoformat'):
+            try:
+                return val.isoformat().split('T')[0]  # Just the date part
+            except:
+                return str(val)
+        return str(val)
+    
+    # Track old values before updating
+    changed_fields_details = []
+    
     for key, value in update_data.items():
+        # Get old value before updating
+        old_value = getattr(db_client, key, None)
+        
+        # Format values for display
+        old_formatted = format_value(old_value)
+        new_formatted = format_value(value)
+        
+        # Only track if value actually changed (compare formatted strings)
+        if old_formatted != new_formatted:
+            # Use human-readable field names
+            field_display = key.replace('_', ' ').title()
+            changed_fields_details.append(f"{field_display}: '{old_formatted}' → '{new_formatted}'")
+        
         setattr(db_client, key, value)
 
     db.commit()
     db.refresh(db_client)
+    
+    # Create activity log in Finance service
+    try:
+        import requests
+        import os
+        finance_api_url = os.getenv("FINANCE_API_URL", "http://finance:8003")
+        user_id = current_user.get("id")
+        
+        # Build details with old → new values
+        if changed_fields_details:
+            details = f"Client {db_client.name} (ID: {db_client.id}) was updated. Changes: {'; '.join(changed_fields_details)}"
+        else:
+            details = f"Client {db_client.name} (ID: {db_client.id}) was updated."
+        
+        activity_log_data = {
+            "user_id": str(user_id),
+            "action": f"Updated client {db_client.name}",
+            "details": details,
+            "client_id": str(db_client.id)
+        }
+        try:
+            requests.post(
+                f"{finance_api_url}/api/activity_logs/",
+                json=activity_log_data,
+                timeout=2
+            )
+        except Exception:
+            pass  # Non-blocking
+    except Exception:
+        pass  # Non-blocking
+    
     return db_client
 
 @router.get("/{client_id}/dashboard", response_model=schemas.ClientDashboard)
@@ -281,8 +378,35 @@ def delete_client(
     db_client = db.query(models.Client).filter(models.Client.id == client_id).first()
     if db_client is None:
         raise HTTPException(status_code=404, detail="Client not found")
+    
+    client_name = db_client.name
+    client_id_str = str(db_client.id)
+    
     db.delete(db_client)
     db.commit()
+    
+    # Create activity log in Finance service
+    try:
+        import requests
+        import os
+        finance_api_url = os.getenv("FINANCE_API_URL", "http://finance:8003")
+        user_id = current_user.get("id")
+        activity_log_data = {
+            "user_id": str(user_id),
+            "action": f"Deleted client {client_name}",
+            "details": f"Client {client_name} (ID: {client_id_str}) was deleted",
+            "client_id": client_id_str
+        }
+        try:
+            requests.post(
+                f"{finance_api_url}/api/activity_logs/",
+                json=activity_log_data,
+                timeout=2
+            )
+        except Exception:
+            pass  # Non-blocking
+    except Exception:
+        pass  # Non-blocking
 
 @router.get("/{client_id}/ledger-balance", response_model=schemas.LedgerBalance)
 def get_ledger_balance(
@@ -295,3 +419,103 @@ def get_ledger_balance(
     if db_client is None:
         raise HTTPException(status_code=404, detail="Client not found")
     return db_client
+
+@router.post("/{client_id}/photo", status_code=status.HTTP_200_OK)
+def upload_client_photo(
+    client_id: uuid.UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """
+    Endpoint to upload a photo for a client.
+    """
+    db_client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    if db_client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded or file has no name.")
+
+    _, file_extension = os.path.splitext(file.filename)
+    object_name = f"clients/{client_id}{file_extension}"
+
+    try:
+        # Delete old photo if exists
+        if db_client.photo_url:
+            # Extract object name from URL (format: https://bucket.s3.amazonaws.com/object_name)
+            try:
+                old_object_name = db_client.photo_url.split('.s3.amazonaws.com/')[-1]
+                delete_file_from_s3(old_object_name)
+            except Exception:
+                pass  # Ignore errors when deleting old photo
+        
+        photo_url = upload_file_to_s3(file, object_name)
+        db_client.photo_url = photo_url
+        db.commit()
+        db.refresh(db_client)
+        return {"message": "Client photo updated successfully", "photo_url": photo_url}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during S3 upload: {e}")
+
+@router.delete("/{client_id}/photo", status_code=status.HTTP_200_OK)
+def delete_client_photo(
+    client_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """
+    Endpoint to delete the photo for a client.
+    """
+    db_client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    if db_client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    
+    if not db_client.photo_url:
+        raise HTTPException(status_code=404, detail="No client photo to delete.")
+    
+    try:
+        # Extract object name from URL (format: https://bucket.s3.amazonaws.com/object_name)
+        object_name = db_client.photo_url.split('.s3.amazonaws.com/')[-1]
+        delete_file_from_s3(object_name)
+        db_client.photo_url = None
+        db.commit()
+        db.refresh(db_client)
+        return {"message": "Client photo deleted successfully"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during S3 deletion: {e}")
+
+@router.get("/{client_id}/photo", status_code=status.HTTP_302_FOUND)
+def get_client_photo(
+    client_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """
+    Endpoint to serve client photo from S3 with authentication via a presigned URL.
+    """
+    db_client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    if db_client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    
+    if not db_client.photo_url:
+        raise HTTPException(status_code=404, detail="No client photo available.")
+    
+    try:
+        # Extract object name from URL (format: https://bucket.s3.amazonaws.com/object_name)
+        object_name = db_client.photo_url.split('.s3.amazonaws.com/')[-1]
+        presigned_url = get_presigned_url(object_name, expiration=3600)  # URL valid for 1 hour
+        
+        # Redirect to the presigned URL
+        return RedirectResponse(url=presigned_url, status_code=status.HTTP_302_FOUND)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during S3 access: {e}")
