@@ -17,7 +17,7 @@ origins = [
     "https://login-api.datainvestigo.com",
     "*",
     "http://localhost:8081",
-    "http://localhost:8080"
+    "http://localhost:8080",
     "https://domain-api.datainvestigo.com",
 ]
 
