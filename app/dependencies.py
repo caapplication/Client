@@ -26,6 +26,12 @@ def get_current_user(
             headers["x-agency-id"] = x_agency_id
         # Use /profile/ with trailing slash to match the router prefix
         profile_url = f"{LOGIN_SERVICE_URL}/profile/" if not LOGIN_SERVICE_URL.endswith('/') else f"{LOGIN_SERVICE_URL}profile/"
+        
+        # Log for debugging (remove sensitive data in production)
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"Validating token with Login service at: {LOGIN_SERVICE_URL}/profile/")
+        
         response = requests.get(profile_url, headers=headers, timeout=10)
         response.raise_for_status()
         user_data = response.json()
@@ -37,11 +43,23 @@ def get_current_user(
             error_detail = error_response.get('detail', error_detail)
         except:
             pass
+        
+        # Enhanced logging for debugging production issues
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Token validation failed: {error_detail}. Login service URL: {LOGIN_SERVICE_URL}")
+        if e.response:
+            logger.error(f"Login service response status: {e.response.status_code}")
+        
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=error_detail,
         )
     except requests.exceptions.RequestException as e:
+        # Enhanced logging for connection errors
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Failed to connect to Login service at {LOGIN_SERVICE_URL}: {e}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Error connecting to authentication service: {e}",
